@@ -436,6 +436,185 @@ void main() {
       completer.completeError("oh no!");
     });
   });
+
+  group('forEach', () {
+    Pool pool;
+
+    tearDown(() async {
+      print('closing pool');
+      await pool.close();
+      print('pool closed!');
+    });
+
+    Future<String> delayedToString(int i) =>
+        Future.delayed(Duration(milliseconds: 10), () => i.toString());
+
+    for (var itemCount in [0, 5]) {
+      for (var poolSize in [1, 5, 6]) {
+        test('poolSize: $poolSize, itemCount: $itemCount', () async {
+          pool = Pool(poolSize);
+
+          try {
+            var finishedItems = 0;
+
+            await for (var item in pool.forEach(
+                Iterable.generate(itemCount, (i) {
+                  expect(i, lessThanOrEqualTo(finishedItems + poolSize),
+                      reason: 'the iterator should be called lazily');
+                  return i;
+                }),
+                delayedToString)) {
+              expect(int.parse(item), lessThan(itemCount));
+              finishedItems++;
+            }
+
+            expect(finishedItems, itemCount);
+          } finally {
+            await pool.close();
+          }
+        });
+      }
+    }
+
+    test('partial iteration', () async {
+      pool = Pool(5);
+      var stream = pool.forEach(Iterable<int>.generate(100), delayedToString);
+      expect(await stream.take(10).toList(), hasLength(10));
+    });
+
+    test('pool close during data with cancel', () async {
+      pool = Pool(5);
+
+      var stream = pool.forEach(Iterable<int>.generate(100), delayedToString);
+
+      var subscription = stream.listen(
+          expectAsync1((data) {
+            pool.close();
+          }, max: 6), onError: expectAsync1((e) {
+        print('the expect!');
+        expect(
+            e,
+            isStateError.having((s) => s.message, 'message',
+                'Pool was closed during iteration.'));
+      }));
+
+      await Future.delayed(Duration(seconds: 1));
+
+      await subscription.cancel();
+    });
+
+    test('pool close during data with waiting to be done', () async {
+      pool = Pool(5);
+
+      var stream = pool.forEach(Iterable<int>.generate(100), delayedToString);
+
+      var subscription = stream.listen((data) {
+        pool.close();
+      });
+
+      await expectLater(
+          subscription.asFuture(),
+          throwsA(isStateError.having((se) => se.message, 'message',
+              'Pool was closed during iteration.')));
+    });
+
+    group('silly', () {
+      for (var i = 0; i < 1; i++) {
+        test('silly #$i', () async {
+          pool = Pool(5);
+
+          var stream =
+              pool.forEach(Iterable<int>.generate(100), delayedToString);
+
+          var subscription = stream.listen((data) {
+            print('data: $data');
+            pool.close();
+          }, onError: (e, stack) {
+            print(['error? weird?', e, stack].join('\n'));
+          });
+
+          print('delaying');
+
+          await Future.delayed(Duration(seconds: 2));
+
+          print('sending cancel');
+          await subscription.cancel();
+          print('test done?');
+        });
+      }
+    });
+
+    group('errors', () {
+      Future<void> errorInIterator(void errorAction(Pool pool),
+          {bool onError(int item, Object error, StackTrace stack)}) async {
+        pool = Pool(20);
+
+        var listFuture = pool
+            .forEach(
+                Iterable.generate(100, (i) {
+                  if (i == 50) {
+                    errorAction(pool);
+                  }
+
+                  return i;
+                }),
+                delayedToString,
+                onError: onError)
+            .toList();
+
+        await expectLater(() async => await listFuture, throwsStateError);
+        print('test finished');
+
+        await Future.delayed(Duration(seconds: 1));
+        print('delayed!');
+      }
+
+      test('iteration, no onError', () async {
+        await errorInIterator((p) => throw StateError('oops'));
+      });
+      test('iteration, with onError', () async {
+        await errorInIterator((p) => throw StateError('oops'),
+            onError: (i, e, s) => false);
+      });
+      test('closed Pool, no onError', () async {
+        await errorInIterator((p) => p.close());
+      });
+      test('closed Pool, with OnError', () async {
+        await errorInIterator((p) => p.close(), onError: (i, e, s) => false);
+      });
+
+      test('error in action, no onError', () async {
+        pool = Pool(20);
+
+        var listFuture = pool.forEach(Iterable<int>.generate(100), (i) async {
+          await Future.delayed(Duration(milliseconds: 10));
+          if (i == 10) {
+            print('boo on 10');
+            throw UnsupportedError('10 is not supported');
+          }
+          return i.toString();
+        }).toList();
+
+        await expectLater(() async => await listFuture, throwsUnsupportedError);
+        print('test finished');
+      });
+
+      test('error in action, no onError', () async {
+        pool = Pool(20);
+
+        var list = await pool.forEach(Iterable<int>.generate(100), (i) async {
+          await Future.delayed(Duration(milliseconds: 10));
+          if (i % 10 == 0) {
+            throw UnsupportedError('10 is not supported');
+          }
+          return i.toString();
+        }, onError: (item, error, stack) => false).toList();
+
+        expect(list, hasLength(90));
+        print('test finished');
+      });
+    });
+  });
 }
 
 /// Returns a function that will cause the test to fail if it's called.
